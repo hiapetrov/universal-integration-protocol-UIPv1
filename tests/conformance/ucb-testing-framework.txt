@@ -1,0 +1,832 @@
+"""
+UCB Testing Framework
+
+This module provides a comprehensive test suite for validating Universal Connector Block
+implementations against the Universal Integration Protocol specification.
+"""
+
+import unittest
+import json
+import time
+import threading
+import http.server
+import socketserver
+from http import HTTPStatus
+from typing import Dict, Any, List, Optional, Tuple, Callable
+import requests
+
+# Import the Universal Connector Block implementation to test
+from universal_connector_block import (
+    UniversalConnectorBlock, 
+    UcbError, 
+    ValidationError,
+    HttpMethod,
+    AuthMethod,
+    ParameterLocation
+)
+
+
+# Mock HTTP Server for testing API requests
+class MockHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+    """Simple HTTP request handler for testing."""
+    
+    # Class variables to configure server behavior
+    responses: Dict[str, Tuple[int, Dict[str, str], str]] = {}
+    request_log: List[Dict[str, Any]] = []
+    delay_seconds: float = 0
+    failure_count: int = 0
+    
+    def do_GET(self):
+        self._handle_request("GET")
+    
+    def do_POST(self):
+        self._handle_request("POST")
+        
+    def do_PUT(self):
+        self._handle_request("PUT")
+        
+    def do_DELETE(self):
+        self._handle_request("DELETE")
+        
+    def _handle_request(self, method):
+        # Record the request
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else ""
+        
+        request_info = {
+            "method": method,
+            "path": self.path,
+            "headers": dict(self.headers),
+            "body": body
+        }
+        self.__class__.request_log.append(request_info)
+        
+        # Apply configured delay
+        if self.__class__.delay_seconds > 0:
+            time.sleep(self.__class__.delay_seconds)
+            
+        # Check if this request should fail based on failure_count
+        if self.__class__.failure_count > 0:
+            self.__class__.failure_count -= 1
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            error_response = json.dumps({
+                "message": "Simulated server error",
+                "details": []
+            })
+            self.wfile.write(error_response.encode('utf-8'))
+            return
+            
+        # Look for matching path in responses
+        key = f"{method} {self.path}"
+        if key in self.__class__.responses:
+            status_code, headers, content = self.__class__.responses[key]
+        else:
+            # Default response if no match found
+            status_code = HTTPStatus.NOT_FOUND
+            headers = {'Content-Type': 'application/json'}
+            content = json.dumps({
+                "message": f"No mock response configured for {key}",
+                "details": []
+            })
+            
+        self.send_response(status_code)
+        for header_name, header_value in headers.items():
+            self.send_header(header_name, header_value)
+        self.end_headers()
+        self.wfile.write(content.encode('utf-8'))
+        
+    def log_message(self, format, *args):
+        # Suppress log messages to keep test output clean
+        pass
+
+
+class MockServer:
+    """Context manager for running a mock HTTP server."""
+    
+    def __init__(self, port=8000):
+        self.port = port
+        self.httpd = None
+        self.server_thread = None
+        
+    def __enter__(self):
+        # Configure handler for this test session
+        MockHTTPRequestHandler.responses = {}
+        MockHTTPRequestHandler.request_log = []
+        MockHTTPRequestHandler.delay_seconds = 0
+        MockHTTPRequestHandler.failure_count = 0
+        
+        # Set up and start the server
+        self.httpd = socketserver.TCPServer(("localhost", self.port), MockHTTPRequestHandler)
+        self.server_thread = threading.Thread(target=self.httpd.serve_forever)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+        
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.httpd:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        if self.server_thread:
+            self.server_thread.join(1)  # Wait for server thread to terminate
+            
+    def add_response(self, method: str, path: str, status_code: int, 
+                    headers: Dict[str, str], content: str):
+        """Add a mock response for a specific request."""
+        key = f"{method} {path}"
+        MockHTTPRequestHandler.responses[key] = (status_code, headers, content)
+        
+    def get_requests(self) -> List[Dict[str, Any]]:
+        """Get log of received requests."""
+        return MockHTTPRequestHandler.request_log
+        
+    def clear_requests(self):
+        """Clear the request log."""
+        MockHTTPRequestHandler.request_log = []
+        
+    def set_delay(self, seconds: float):
+        """Set a delay for all responses."""
+        MockHTTPRequestHandler.delay_seconds = seconds
+        
+    def set_failure_count(self, count: int):
+        """Set the number of requests that should fail with 500 error."""
+        MockHTTPRequestHandler.failure_count = count
+
+
+class UCBTestCase(unittest.TestCase):
+    """Base test case for UCB tests with utility methods."""
+    
+    @classmethod
+    def setUpClass(cls):
+        # Start mock server on port 8000
+        cls.server = MockServer(port=8000).__enter__()
+        
+    @classmethod
+    def tearDownClass(cls):
+        # Shut down mock server
+        if hasattr(cls, 'server'):
+            cls.server.__exit__(None, None, None)
+            
+    def setUp(self):
+        # Create a fresh UCB instance for each test
+        self.ucb = UniversalConnectorBlock(
+            app_name="TestApp",
+            version="1.0.0",
+            base_path="/api/test"
+        )
+        
+        # Clear mock server request log
+        self.server.clear_requests()
+        
+    def assertUssType(self, value: Any, expected_type: str, msg=None):
+        """Assert that a value has the expected USS type."""
+        actual_type = self.ucb.standardize_output(value)
+        actual_type_json = json.loads(actual_type)
+        actual_uss_type = actual_type_json.get('metadata', {}).get('type')
+        
+        self.assertEqual(actual_uss_type, expected_type, 
+                         msg or f"Expected USS type {expected_type}, got {actual_uss_type}")
+                         
+    def assertValidUssDescriptor(self, descriptor: Dict[str, Any]):
+        """Assert that a USS descriptor is valid according to spec."""
+        # Basic structure checks
+        self.assertIn('@context', descriptor)
+        self.assertIn('@type', descriptor)
+        self.assertIn('@id', descriptor)
+        self.assertIn('version', descriptor)
+        self.assertIn('name', descriptor)
+        self.assertIn('basePath', descriptor)
+        self.assertIn('endpoints', descriptor)
+        
+        # Type checks
+        self.assertIsInstance(descriptor['@context'], str)
+        self.assertIsInstance(descriptor['@type'], str)
+        self.assertIsInstance(descriptor['@id'], str)
+        self.assertIsInstance(descriptor['version'], str)
+        self.assertIsInstance(descriptor['name'], str)
+        self.assertIsInstance(descriptor['basePath'], str)
+        self.assertIsInstance(descriptor['endpoints'], list)
+        
+        # Endpoints checks
+        for endpoint in descriptor['endpoints']:
+            self.assertIn('path', endpoint)
+            self.assertIn('method', endpoint)
+            self.assertIn('parameters', endpoint)
+            self.assertIn('responses', endpoint)
+            self.assertIn('authentication', endpoint)
+            
+            self.assertIsInstance(endpoint['path'], str)
+            self.assertIsInstance(endpoint['method'], str)
+            self.assertIsInstance(endpoint['parameters'], list)
+            self.assertIsInstance(endpoint['responses'], list)
+            self.assertIsInstance(endpoint['authentication'], dict)
+            
+            # Authentication
+            auth = endpoint['authentication']
+            self.assertIn('required', auth)
+            self.assertIn('methods', auth)
+            self.assertIsInstance(auth['required'], bool)
+            self.assertIsInstance(auth['methods'], list)
+
+
+class TypeMappingTests(UCBTestCase):
+    """Tests for USS type mapping and conversion."""
+    
+    def test_basic_type_mapping(self):
+        """Test mapping of basic Python types to USS types."""
+        # String
+        self.assertUssType("hello", "String")
+        
+        # Integer
+        self.assertUssType(42, "Integer")
+        
+        # Float
+        self.assertUssType(3.14, "Float")
+        
+        # Boolean
+        self.assertUssType(True, "Boolean")
+        self.assertUssType(False, "Boolean")
+        
+        # Null
+        self.assertUssType(None, "Null")
+        
+        # Object
+        self.assertUssType({"name": "Test"}, "Object")
+        
+        # Array
+        self.assertUssType([1, 2, 3], "Array")
+        
+    def test_type_conversion(self):
+        """Test conversion between types."""
+        # Test valid conversions
+        test_cases = [
+            ('"42"', "Integer", 42),
+            ('"3.14"', "Float", 3.14),
+            ('"true"', "Boolean", True),
+            ('"false"', "Boolean", False),
+            ('42', "String", "42")
+        ]
+        
+        for universal_data, uss_type, expected in test_cases:
+            json_data = json.dumps({"data": json.loads(universal_data)})
+            result = self.ucb.translate_input(json_data, uss_type)
+            self.assertEqual(result, expected)
+            
+        # Test invalid conversions
+        invalid_cases = [
+            ('"hello"', "Integer"),
+            ('"world"', "Float"),
+            ('"maybe"', "Boolean"),
+            ('null', "String")
+        ]
+        
+        for universal_data, uss_type in invalid_cases:
+            json_data = json.dumps({"data": json.loads(universal_data)})
+            with self.assertRaises(ValidationError):
+                self.ucb.translate_input(json_data, uss_type)
+                
+    def test_complex_type_validation(self):
+        """Test validation of complex types."""
+        # Valid array of integers
+        json_data = json.dumps({"data": [1, 2, 3]})
+        result = self.ucb.translate_input(json_data, "Array<Integer>")
+        self.assertEqual(result, [1, 2, 3])
+        
+        # Invalid array with non-integers
+        json_data = json.dumps({"data": [1, "two", 3]})
+        with self.assertRaises(ValidationError):
+            self.ucb.translate_input(json_data, "Array<Integer>")
+            
+        # Valid object
+        json_data = json.dumps({"data": {"name": "Test", "value": 42}})
+        result = self.ucb.translate_input(json_data, "Object")
+        self.assertEqual(result, {"name": "Test", "value": 42})
+        
+        # Invalid object
+        json_data = json.dumps({"data": "not an object"})
+        with self.assertRaises(ValidationError):
+            self.ucb.translate_input(json_data, "Object")
+
+
+class DescriptorGenerationTests(UCBTestCase):
+    """Tests for USS API descriptor generation."""
+    
+    def test_basic_descriptor(self):
+        """Test generation of basic API descriptor."""
+        descriptor_str = self.ucb.expose_descriptor()
+        descriptor = json.loads(descriptor_str)
+        
+        self.assertValidUssDescriptor(descriptor)
+        self.assertEqual(descriptor['name'], "TestApp")
+        self.assertEqual(descriptor['version'], "1.0.0")
+        self.assertEqual(descriptor['basePath'], "/api/test")
+        
+    def test_descriptor_with_endpoints(self):
+        """Test descriptor generation with registered endpoints."""
+        # Register some test endpoints
+        self.ucb.register_endpoint(
+            path="/users/{user_id}",
+            method=HttpMethod.GET,
+            handler=lambda user_id: {"id": user_id, "name": "Test User"},
+            description="Get user by ID"
+        )
+        
+        self.ucb.register_endpoint(
+            path="/users",
+            method=HttpMethod.POST,
+            handler=lambda name, email: {"name": name, "email": email},
+            description="Create a new user"
+        )
+        
+        # Get the descriptor
+        descriptor_str = self.ucb.expose_descriptor()
+        descriptor = json.loads(descriptor_str)
+        
+        # Basic validation
+        self.assertValidUssDescriptor(descriptor)
+        
+        # Check endpoints
+        self.assertEqual(len(descriptor['endpoints']), 2)
+        
+        # Check first endpoint
+        get_endpoint = descriptor['endpoints'][0]
+        self.assertEqual(get_endpoint['path'], "/users/{user_id}")
+        self.assertEqual(get_endpoint['method'], "GET")
+        self.assertEqual(get_endpoint['description'], "Get user by ID")
+        
+        # Check second endpoint
+        post_endpoint = descriptor['endpoints'][1]
+        self.assertEqual(post_endpoint['path'], "/users")
+        self.assertEqual(post_endpoint['method'], "POST")
+        self.assertEqual(post_endpoint['description'], "Create a new user")
+        
+        # Check parameters
+        self.assertEqual(len(post_endpoint['parameters']), 2)
+        param_names = [p['name'] for p in post_endpoint['parameters']]
+        self.assertIn('name', param_names)
+        self.assertIn('email', param_names)
+
+
+class DataStandardizationTests(UCBTestCase):
+    """Tests for data standardization and translation."""
+    
+    def test_standardize_output(self):
+        """Test standardization of native data to USS format."""
+        data = {"name": "Test User", "age": 30}
+        universal_output = self.ucb.standardize_output(data)
+        parsed = json.loads(universal_output)
+        
+        self.assertIn('data', parsed)
+        self.assertIn('metadata', parsed)
+        self.assertEqual(parsed['data'], data)
+        self.assertEqual(parsed['metadata']['type'], "Object")
+        
+    def test_translate_input(self):
+        """Test translation of USS format to native data."""
+        original_data = {"name": "Test User", "age": 30}
+        universal_input = json.dumps({
+            "data": original_data,
+            "metadata": {"type": "Object"}
+        })
+        
+        native_input = self.ucb.translate_input(universal_input)
+        self.assertEqual(native_input, original_data)
+        
+    def test_round_trip_conversion(self):
+        """Test round-trip conversion preserves data."""
+        original_data = {
+            "name": "Test User", 
+            "age": 30, 
+            "active": True,
+            "scores": [10, 20, 30],
+            "address": {
+                "street": "123 Main St",
+                "city": "Testville"
+            }
+        }
+        
+        # Standardize to universal format
+        universal_output = self.ucb.standardize_output(original_data)
+        
+        # Translate back to native format
+        round_trip_data = self.ucb.translate_input(universal_output)
+        
+        # Verify data is preserved
+        self.assertEqual(round_trip_data, original_data)
+
+
+class RemoteApiTests(UCBTestCase):
+    """Tests for remote API calls with resilience patterns."""
+    
+    def test_successful_api_call(self):
+        """Test successful API call."""
+        # Configure mock response
+        response_data = {"id": "123", "name": "Test User"}
+        self.server.add_response(
+            method="GET",
+            path="/api/users/123",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # Make the API call
+        result = self.ucb.call_remote_api(
+            url="http://localhost:8000/api/users/123"
+        )
+        
+        # Verify result
+        self.assertEqual(result, response_data)
+        
+        # Verify request was made correctly
+        requests = self.server.get_requests()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["method"], "GET")
+        self.assertEqual(requests[0]["path"], "/api/users/123")
+        
+    def test_api_call_with_auth(self):
+        """Test API call with authentication."""
+        # Configure mock response
+        response_data = {"status": "success"}
+        self.server.add_response(
+            method="POST",
+            path="/api/secure",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # Make the API call with bearer token
+        result = self.ucb.call_remote_api(
+            url="http://localhost:8000/api/secure",
+            method="POST",
+            data={"action": "test"},
+            auth={
+                "type": "bearer",
+                "token": "test-token-123"
+            }
+        )
+        
+        # Verify result
+        self.assertEqual(result, response_data)
+        
+        # Verify request was made correctly
+        requests = self.server.get_requests()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["method"], "POST")
+        self.assertEqual(requests[0]["path"], "/api/secure")
+        self.assertIn("Authorization", requests[0]["headers"])
+        self.assertEqual(requests[0]["headers"]["Authorization"], "Bearer test-token-123")
+        
+    def test_retry_on_server_error(self):
+        """Test automatic retry on server error."""
+        # Configure mock server to fail twice then succeed
+        self.server.set_failure_count(2)
+        
+        response_data = {"status": "success"}
+        self.server.add_response(
+            method="GET",
+            path="/api/retry-test",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # Make the API call with retry configuration
+        result = self.ucb.call_remote_api(
+            url="http://localhost:8000/api/retry-test",
+            retry_attempts=3
+        )
+        
+        # Verify result was eventually successful
+        self.assertEqual(result, response_data)
+        
+        # Verify that the request was made 3 times (2 failures + 1 success)
+        requests = self.server.get_requests()
+        self.assertEqual(len(requests), 3)
+        
+    def test_circuit_breaker(self):
+        """Test circuit breaker pattern."""
+        # Configure mock server to always fail
+        self.server.set_failure_count(10)
+        
+        # Make API calls until circuit breaker trips
+        max_attempts = 10
+        attempts = 0
+        
+        # Make calls that will fail
+        for i in range(max_attempts):
+            try:
+                self.ucb.call_remote_api(
+                    url="http://localhost:8000/api/circuit-test",
+                    retry_attempts=1
+                )
+                attempts += 1
+            except UcbError as e:
+                if e.error_code == "CIRCUIT_OPEN":
+                    # Circuit breaker tripped
+                    break
+        
+        # Verify circuit breaker eventually tripped
+        self.assertLess(attempts, max_attempts, 
+                       "Circuit breaker should have tripped before max attempts")
+        
+    def test_rate_limiting(self):
+        """Test rate limiting functionality."""
+        # Configure mock server with fast response
+        response_data = {"status": "success"}
+        self.server.add_response(
+            method="GET",
+            path="/api/rate-limit-test",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # Configure UCB with low rate limit
+        self.ucb.rate_limiter = RateLimiter(calls_per_minute=3)
+        
+        # Make successful calls up to the limit
+        for i in range(3):
+            result = self.ucb.call_remote_api(
+                url="http://localhost:8000/api/rate-limit-test"
+            )
+            self.assertEqual(result, response_data)
+            
+        # Next call should fail with rate limit error
+        with self.assertRaises(UcbError) as context:
+            self.ucb.call_remote_api(
+                url="http://localhost:8000/api/rate-limit-test"
+            )
+            
+        self.assertEqual(context.exception.error_code, "RATE_LIMIT_EXCEEDED")
+        
+    def test_caching(self):
+        """Test response caching functionality."""
+        # Configure mock response
+        response_data = {"id": "123", "timestamp": time.time()}
+        self.server.add_response(
+            method="GET",
+            path="/api/cache-test",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # First call should hit the server
+        result1 = self.ucb.call_remote_api(
+            url="http://localhost:8000/api/cache-test",
+            use_cache=True
+        )
+        
+        # Second call should use cached result
+        result2 = self.ucb.call_remote_api(
+            url="http://localhost:8000/api/cache-test",
+            use_cache=True
+        )
+        
+        # Results should be identical
+        self.assertEqual(result1, result2)
+        
+        # Verify only one request was made to the server
+        requests = self.server.get_requests()
+        self.assertEqual(len(requests), 1)
+
+
+class ErrorHandlingTests(UCBTestCase):
+    """Tests for error handling functionality."""
+    
+    def test_client_error_handling(self):
+        """Test handling of client errors (4xx)."""
+        # Configure mock response for 404
+        error_data = {
+            "message": "User not found",
+            "details": [{"userId": "123"}]
+        }
+        self.server.add_response(
+            method="GET",
+            path="/api/users/123",
+            status_code=404,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(error_data)
+        )
+        
+        # Make the API call that should result in 404
+        with self.assertRaises(UcbError) as context:
+            self.ucb.call_remote_api(
+                url="http://localhost:8000/api/users/123"
+            )
+            
+        # Verify error information
+        error = context.exception
+        self.assertEqual(error.error_code, "REMOTE_CLIENT_ERROR_404")
+        self.assertEqual(error.message, "User not found")
+        self.assertEqual(error.details, [{"userId": "123"}])
+        self.assertEqual(error.status_code, 404)
+        
+    def test_timeout_handling(self):
+        """Test handling of request timeouts."""
+        # Configure mock server with delay
+        self.server.set_delay(0.5)
+        
+        response_data = {"status": "success"}
+        self.server.add_response(
+            method="GET",
+            path="/api/slow-response",
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(response_data)
+        )
+        
+        # Make the API call with short timeout
+        with self.assertRaises(UcbError) as context:
+            self.ucb.call_remote_api(
+                url="http://localhost:8000/api/slow-response",
+                timeout=0.1  # 100ms timeout
+            )
+            
+        # Verify error information
+        error = context.exception
+        self.assertIn(error.error_code, ["TIMEOUT_ERROR", "CONNECTION_ERROR"])
+        
+    def test_validation_error(self):
+        """Test input validation errors."""
+        # Malformed universal data (missing 'data' field)
+        invalid_data = json.dumps({"metadata": {"type": "String"}})
+        
+        with self.assertRaises(ValidationError) as context:
+            self.ucb.translate_input(invalid_data)
+            
+        # Invalid JSON data
+        with self.assertRaises(ValidationError):
+            self.ucb.translate_input("{not valid json")
+
+
+class EndpointHandlingTests(UCBTestCase):
+    """Tests for endpoint registration and request handling."""
+    
+    def test_endpoint_registration(self):
+        """Test registration of API endpoints."""
+        # Define test handler functions
+        def get_user(user_id: str):
+            return {"id": user_id, "name": "Test User"}
+            
+        def create_user(name: str, email: str):
+            return {"name": name, "email": email}
+            
+        # Register endpoints
+        self.ucb.register_endpoint(
+            path="/users/{user_id}",
+            method=HttpMethod.GET,
+            handler=get_user,
+            description="Get user by ID"
+        )
+        
+        self.ucb.register_endpoint(
+            path="/users",
+            method=HttpMethod.POST,
+            handler=create_user,
+            description="Create a new user"
+        )
+        
+        # Verify endpoints were registered
+        self.assertEqual(len(self.ucb.endpoints), 2)
+        
+    def test_request_handling(self):
+        """Test handling of incoming requests."""
+        # Define test handler
+        def get_user(user_id: str):
+            return {"id": user_id, "name": "Test User"}
+            
+        # Register endpoint
+        self.ucb.register_endpoint(
+            path="/users/{user_id}",
+            method=HttpMethod.GET,
+            handler=get_user
+        )
+        
+        # Handle a valid request
+        result = self.ucb.handle_request(
+            path="/users/123",
+            method="GET",
+            headers={"Authorization": "Bearer test-token"}
+        )
+        
+        # Verify result
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["id"], "123")
+        self.assertEqual(result["data"]["name"], "Test User")
+        
+    def test_missing_endpoint(self):
+        """Test handling of requests for non-existent endpoints."""
+        with self.assertRaises(UcbError) as context:
+            self.ucb.handle_request(
+                path="/not-found",
+                method="GET"
+            )
+            
+        error = context.exception
+        self.assertEqual(error.error_code, "ENDPOINT_NOT_FOUND")
+        
+    def test_auth_required(self):
+        """Test handling of authentication requirements."""
+        # Define test handler
+        def secure_action():
+            return {"status": "success"}
+            
+        # Register endpoint with auth required
+        self.ucb.register_endpoint(
+            path="/secure",
+            method=HttpMethod.GET,
+            handler=secure_action,
+            auth_required=True
+        )
+        
+        # Request without auth header should fail
+        with self.assertRaises(UcbError) as context:
+            self.ucb.handle_request(
+                path="/secure",
+                method="GET"
+            )
+            
+        error = context.exception
+        self.assertEqual(error.error_code, "AUTHENTICATION_REQUIRED")
+        
+        # Request with auth header should succeed
+        result = self.ucb.handle_request(
+            path="/secure",
+            method="GET",
+            headers={"Authorization": "Bearer test-token"}
+        )
+        
+        self.assertEqual(result["status"], "success")
+        
+    def test_parameter_validation(self):
+        """Test validation of request parameters."""
+        # Define test handler with typed parameters
+        def create_item(name: str, quantity: int, price: float):
+            return {
+                "name": name,
+                "quantity": quantity,
+                "price": price,
+                "total": quantity * price
+            }
+            
+        # Register endpoint
+        self.ucb.register_endpoint(
+            path="/items",
+            method=HttpMethod.POST,
+            handler=create_item
+        )
+        
+        # Valid request with all parameters
+        result = self.ucb.handle_request(
+            path="/items",
+            method="POST",
+            params={
+                "__body": {
+                    "name": "Test Item",
+                    "quantity": 5,
+                    "price": 9.99
+                }
+            },
+            headers={"Authorization": "Bearer test-token"}
+        )
+        
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["total"], 49.95)
+        
+        # Invalid request with missing parameter
+        with self.assertRaises(ValidationError):
+            self.ucb.handle_request(
+                path="/items",
+                method="POST",
+                params={
+                    "__body": {
+                        "name": "Test Item",
+                        "price": 9.99
+                    }
+                },
+                headers={"Authorization": "Bearer test-token"}
+            )
+            
+        # Invalid request with wrong type
+        with self.assertRaises(ValidationError):
+            self.ucb.handle_request(
+                path="/items",
+                method="POST",
+                params={
+                    "__body": {
+                        "name": "Test Item",
+                        "quantity": "not a number",
+                        "price": 9.99
+                    }
+                },
+                headers={"Authorization": "Bearer test-token"}
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
